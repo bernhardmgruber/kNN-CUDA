@@ -31,11 +31,6 @@ __global__ void compute_distances(float * ref,
     __shared__ float shared_B[BLOCK_DIM][BLOCK_DIM];
 
     // Sub-matrix of A (begin, step, end) and Sub-matrix of B (begin, step)
-    __shared__ int begin_A;
-    __shared__ int begin_B;
-    __shared__ int step_A;
-    __shared__ int step_B;
-    __shared__ int end_A;
 
     // Thread index
     int tx = threadIdx.x;
@@ -45,11 +40,11 @@ __global__ void compute_distances(float * ref,
     float ssd = 0.f;
 
     // Loop parameters
-    begin_A = BLOCK_DIM * blockIdx.y;
-    begin_B = BLOCK_DIM * blockIdx.x;
-    step_A  = BLOCK_DIM * ref_pitch;
-    step_B  = BLOCK_DIM * query_pitch;
-    end_A   = begin_A + (height-1) * ref_pitch;
+    const int begin_A = BLOCK_DIM * blockIdx.y;
+    const int begin_B = BLOCK_DIM * blockIdx.x;
+    const int step_A = BLOCK_DIM * ref_pitch;
+    const int step_B = BLOCK_DIM * query_pitch;
+    const int end_A = begin_A + (height-1) * ref_pitch;
 
     // Conditions
     int cond0 = (begin_A + tx < ref_width); // used to write in shared memory
@@ -78,10 +73,10 @@ __global__ void compute_distances(float * ref,
                 float tmp = shared_A[k][ty] - shared_B[k][tx];
                 ssd += tmp*tmp;
             }
-        }
 
-        // Synchronize to make sure that the preceeding computation is done before loading two new sub-matrices of A and B in the next iteration
-        __syncthreads();
+            // Synchronize to make sure that the preceeding computation is done before loading two new sub-matrices of A and B in the next iteration
+            __syncthreads();
+        }
     }
 
     // Write the block sub-matrix to device memory; each thread writes one element
