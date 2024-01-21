@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <vector>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,6 +175,51 @@ bool knn_c(const float * ref,
 
 }
 
+bool knn_bgruber(const float *ref,
+                 int ref_nb,
+                 const float *query,
+                 int query_nb,
+                 int dim,
+                 int k,
+                 float *knn_dist,
+                 int *knn_index) {
+
+    thread_local std::vector<float> nnDist;
+    thread_local std::vector<int> nnIndex;
+    nnDist.reserve(k);
+    nnIndex.reserve(k);
+
+#pragma omp parallel for
+    for (int i = 0; i < query_nb; i++) {
+        nnDist.clear();
+        nnIndex.clear();
+        for (int j = 0; j < ref_nb; j++) {
+            float sum = 0;
+            for (int d = 0; d < dim; d++) {
+                const auto diff = ref[d * ref_nb + j] - query[d * query_nb + i];
+                sum += diff * diff;
+            }
+            const auto dist = std::sqrt(sum);
+
+            const auto off = std::lower_bound(begin(nnDist), end(nnDist), dist) - begin(nnDist);
+            if (off < k) {
+                if (nnDist.size() == k) {
+                    nnDist.pop_back();
+                    nnIndex.pop_back();
+                }
+                nnDist.insert(begin(nnDist) + off, dist);
+                nnIndex.insert(begin(nnIndex) + off, j);
+            }
+        }
+
+        for (int j = 0; j < k; ++j) {
+            knn_dist[j * query_nb + i] = nnDist[j];
+            knn_index[j * query_nb + i] = nnIndex[j];
+        }
+    }
+
+    return true;
+}
 
 /**
  * Test an input k-NN function implementation by verifying that its output
@@ -292,10 +338,11 @@ bool test(const float * ref,
 int main(void) {
 
     // Parameters
-    const int ref_nb   = 16384;
-    const int query_nb = 4096;
+    const int ref_nb   = 16384 / 4;
+    const int query_nb = 4096 / 4;
     const int dim      = 128;
     const int k        = 16;
+    constexpr int iterations = 10;
 
     // Display
     printf("PARAMETERS\n");
@@ -331,7 +378,7 @@ int main(void) {
 
     // Compute the ground truth k-NN distances and indexes for each query point
     printf("Ground truth computation in progress...\n\n");
-    if (!knn_c(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index)) {
+    if (!knn_cublas(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index)) {
         free(ref);
 	    free(query);
 	    free(knn_dist);
@@ -341,10 +388,13 @@ int main(void) {
 
     // Test all k-NN functions
     printf("TESTS\n");
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_c,            "knn_c",              2);
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global,  "knn_cuda_global",  100); 
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_texture, "knn_cuda_texture", 100); 
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cublas,       "knn_cublas",       100); 
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_c,        "knn_c",              2);
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_bgruber, "knn_bgruber", 2);
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global, "knn_cuda_global", iterations);
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global_no_shared, "knn_cuda_global_nsm",
+         iterations);
+    //test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_texture, "knn_cuda_texture", iterations);
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cublas, "knn_cublas", iterations);
 
     // Deallocate memory 
     free(ref);
