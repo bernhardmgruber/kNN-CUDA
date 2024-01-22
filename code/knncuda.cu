@@ -105,6 +105,192 @@ __global__ void compute_distances_no_shared(float * ref,
     }
 }
 
+__device__ float sqrDiff(float a, float b) {
+    auto d = a - b;
+    return d * d;
+}
+
+#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+const int WARPSIZE = 32; // warpSize is not constexpr
+
+namespace wt {
+    template<const int BM, const int BN, const int BK, const int rowStrideA,
+            const int rowStrideB>
+    __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
+                                 float *As, float *Bs, int innerRowA, int innerColA,
+                                 int innerRowB, int innerColB) {
+        for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
+            const float4 tmp = reinterpret_cast<const float4 *>(
+                    &A[(innerRowA + offset) * K + innerColA * 4])[0];
+            // float4 tmp;
+            // asm("ld.global.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
+            //     : "=f"(tmp.x), "=f"(tmp.y), "=f"(tmp.z), "=f"(tmp.w)
+            //     : "l"(&A[(innerRowA + offset) * K + innerColA * 4]));
+            As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
+            As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
+            As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
+            As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
+        }
+
+        for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
+            reinterpret_cast<float4 *>(
+                    &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
+                    reinterpret_cast<const float4 *>(
+                            &B[(innerRowB + offset) * N + innerColB * 4])[0];
+            // asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+            //     : "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 0]),
+            //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 1]),
+            //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 2]),
+            //       "=f"(Bs[(innerRowB + offset) * BN + innerColB * 4 + 3])
+            //     : "l"(&B[(innerRowB + offset) * N + innerColB * 4]));
+        }
+    }
+
+    template<const int BM, const int BN, const int BK, const int WM, const int WN,
+            const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
+            const int TM, const int TN>
+    __device__ void
+    processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
+                    const float *Bs, const uint warpRow, const uint warpCol,
+                    const uint threadRowInWarp, const uint threadColInWarp) {
+        for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            // populate registers for whole warptile
+            for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+                for (uint i = 0; i < TM; ++i) {
+                    regM[wSubRowIdx * TM + i] =
+                            As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
+                               threadRowInWarp * TM + i];
+                }
+            }
+            for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+                for (uint i = 0; i < TN; ++i) {
+                    regN[wSubColIdx * TN + i] =
+                            Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
+                               threadColInWarp * TN + i];
+                }
+            }
+
+            // execute warptile matmul
+            for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+                for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+                    // calculate per-thread results
+                    for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                            threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                                          (wSubColIdx * TN) + resIdxN] +=
+                                    sqrDiff(regM[wSubRowIdx * TM + resIdxM],
+                                            regN[wSubColIdx * TN + resIdxN]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+} // namespace wt
+
+/*
+ * @tparam BM The threadblock size for M dimension SMEM caching.
+ * @tparam BN The threadblock size for N dimension SMEM caching.
+ * @tparam BK The threadblock size for K dimension SMEM caching.
+ * @tparam WM M dim of continuous tile computed by each warp
+ * @tparam WN N dim of continuous tile computed by each warp
+ * @tparam WMITER The number of subwarp tiling steps in M dimension.
+ * @tparam WNITER The number of subwarp tiling steps in N dimension.
+ * @tparam TM The per-thread tile size for M dimension.
+ * @tparam TN The per-thread tile size for N dimension.
+ */
+template<const int BM, const int BN, const int BK, const int WM, const int WN,
+        const int WNITER, const int TM, const int TN, const int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS)
+sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
+                float beta, float *C) {
+    const uint cRow = blockIdx.y;
+    const uint cCol = blockIdx.x;
+
+    // Placement of the warp in the threadblock tile
+    const uint warpIdx = threadIdx.x / WARPSIZE; // the warp this thread is in
+    const uint warpCol = warpIdx % (BN / WN);
+    const uint warpRow = warpIdx / (BN / WN);
+
+    // size of the warp subtile
+    constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
+    constexpr uint WSUBM = WM / WMITER; // 64/2=32
+    constexpr uint WSUBN = WN / WNITER; // 32/2=16
+
+    // Placement of the thread in the warp subtile
+    const uint threadIdxInWarp = threadIdx.x % WARPSIZE;         // [0, 31]
+    const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN); // i%(16/4)
+    const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN); // i/4
+
+    // allocate space for the current blocktile in SMEM
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
+
+    // Move blocktile to beginning of A's row and B's column
+    A += cRow * BM * K;
+    B += cCol * BN;
+    // Move C_ptr to warp's output tile
+    C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+
+    // calculating the indices that this thread will load into SMEM
+    // we'll load 128bit / 32bit = 4 elements per thread at each step
+    const uint innerRowA = threadIdx.x / (BK / 4);
+    const uint innerColA = threadIdx.x % (BK / 4);
+    constexpr uint rowStrideA = (NUM_THREADS * 4) / BK;
+    const uint innerRowB = threadIdx.x / (BN / 4);
+    const uint innerColB = threadIdx.x % (BN / 4);
+    constexpr uint rowStrideB = NUM_THREADS / (BN / 4);
+
+    // allocate thread-local cache for results in registerfile
+    float threadResults[WMITER * TM * WNITER * TN] = {0.0};
+    // we cache into registers on the warptile level
+    float regM[WMITER * TM] = {0.0};
+    float regN[WNITER * TN] = {0.0};
+
+    // outer-most loop over block tiles
+    for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
+                N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
+        __syncthreads();
+        wt::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
+                TN>(regM, regN, threadResults, As, Bs, warpRow, warpCol,
+                    threadRowInWarp, threadColInWarp);
+        A += BK;     // move BK columns to right
+        B += BK * N; // move BK rows down
+        __syncthreads();
+    }
+
+    // write out the results
+    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+            // move C pointer to current warp subtile
+            float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
+            for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
+                for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
+                    // load C vector into registers
+                    float4 tmp = reinterpret_cast<float4 *>(
+                            &C_interim[(threadRowInWarp * TM + resIdxM) * N +
+                                       threadColInWarp * TN + resIdxN])[0];
+                    // perform GEMM update in reg
+                    const int i = (wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                                  wSubColIdx * TN + resIdxN;
+                    tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
+                    tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
+                    tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
+                    tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
+                    // write back
+                    reinterpret_cast<float4 *>(
+                            &C_interim[(threadRowInWarp * TM + resIdxM) * N +
+                                       threadColInWarp * TN + resIdxN])[0] = tmp;
+                }
+            }
+        }
+    }
+}
+
+
+
 /**
  * Computes the squared Euclidean distance matrix between the query points and the reference points.
  *
@@ -554,8 +740,10 @@ bool knn_cuda_global_no_shared(const float * ref,
     }
 
     // Copy k smallest distances / indexes from the device to the host
-    err0 = cudaMemcpy2D(knn_dist,  query_nb * size_of_float, dist_dev,  dist_pitch_in_bytes,  query_nb * size_of_float, k, cudaMemcpyDeviceToHost);
-    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int,   index_dev, index_pitch_in_bytes, query_nb * size_of_int,   k, cudaMemcpyDeviceToHost);
+    err0 = cudaMemcpy2D(knn_dist, query_nb * size_of_float, dist_dev, dist_pitch_in_bytes, query_nb * size_of_float, k,
+                        cudaMemcpyDeviceToHost);
+    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int, index_dev, index_pitch_in_bytes, query_nb * size_of_int, k,
+                        cudaMemcpyDeviceToHost);
     if (err0 != cudaSuccess || err1 != cudaSuccess) {
         printf("ERROR: Unable to copy data from device to host\n");
         cudaFree(ref_dev);
@@ -575,18 +763,223 @@ bool knn_cuda_global_no_shared(const float * ref,
 }
 
 
-bool knn_cuda_texture(const float * ref,
-                      int           ref_nb,
-                      const float * query,
-                      int           query_nb,
-                      int           dim,
-                      int           k,
-                      float *       knn_dist,
-                      int *         knn_index) {
+bool knn_cuda_global_gemm(const float *ref,
+                               int ref_nb,
+                               const float *query,
+                               int query_nb,
+                               int dim,
+                               int k,
+                               float *knn_dist,
+                               int *knn_index) {
+
+    // Constants
+    const unsigned int size_of_float = sizeof(float);
+    const unsigned int size_of_int = sizeof(int);
+
+    // Return variables
+    cudaError_t err0, err1, err2, err3;
+
+    // Check that we have at least one CUDA device
+    int nb_devices;
+    err0 = cudaGetDeviceCount(&nb_devices);
+    if (err0 != cudaSuccess || nb_devices == 0) {
+        printf("ERROR: No CUDA device found\n");
+        return false;
+    }
+
+    // Select the first CUDA device as default
+    err0 = cudaSetDevice(0);
+    if (err0 != cudaSuccess) {
+        printf("ERROR: Cannot set the chosen CUDA device\n");
+        return false;
+    }
+
+    // Allocate global memory
+    float *ref_dev = NULL;
+    float *query_dev = NULL;
+    float *dist_dev = NULL;
+    int *index_dev = NULL;
+    err0 = cudaMalloc((void **) &ref_dev, ref_nb * size_of_float * dim);
+    err1 = cudaMalloc((void **) &query_dev, query_nb * size_of_float * dim);
+    err2 = cudaMalloc((void **) &dist_dev, query_nb * size_of_float * ref_nb);
+    err3 = cudaMalloc((void **) &index_dev, query_nb * size_of_int * k);
+    if (err0 != cudaSuccess || err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess) {
+        printf("ERROR: Memory allocation error\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Deduce pitch values
+    size_t ref_pitch = ref_nb;
+    size_t query_pitch = query_nb;
+    size_t dist_pitch = query_nb;
+    size_t index_pitch = query_nb;
+
+    // Check pitch values
+    if (query_pitch != dist_pitch || query_pitch != index_pitch) {
+        printf("ERROR: Invalid pitch value\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Copy reference and query data from the host to the device
+    err0 = cudaMemcpy(ref_dev, ref, ref_nb * size_of_float * dim, cudaMemcpyHostToDevice);
+    err1 = cudaMemcpy(query_dev, query, query_nb * size_of_float * dim, cudaMemcpyHostToDevice);
+    if (err0 != cudaSuccess || err1 != cudaSuccess) {
+        printf("ERROR: Unable to copy data from host to device\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Compute the squared Euclidean distances
+//    dim3 block0(BLOCK_DIM, BLOCK_DIM, 1);
+//    dim3 grid0(query_nb / BLOCK_DIM, ref_nb / BLOCK_DIM, 1);
+//    if (query_nb % BLOCK_DIM != 0) grid0.x += 1;
+//    if (ref_nb % BLOCK_DIM != 0) grid0.y += 1;
+
+/*
+ * @tparam BM The threadblock size for M dimension SMEM caching.
+ * @tparam BN The threadblock size for N dimension SMEM caching.
+ * @tparam BK The threadblock size for K dimension SMEM caching.
+ * @tparam WM M dim of continuous tile computed by each warp
+ * @tparam WN N dim of continuous tile computed by each warp
+ * @tparam WMITER The number of subwarp tiling steps in M dimension.
+ * @tparam WNITER The number of subwarp tiling steps in N dimension.
+ * @tparam TM The per-thread tile size for M dimension.
+ * @tparam TN The per-thread tile size for N dimension.
+ */
+    const uint K10_NUM_THREADS = 128;
+    const uint K10_BN = 128;
+    const uint K10_BM = 128;
+    const uint K10_BK = 16;
+    const uint K10_WN = 64;
+    const uint K10_WM = 64;
+    const uint K10_WNITER = 4;
+    const uint K10_TN = 4;
+    const uint K10_TM = 8;
+    dim3 blockDim(K10_NUM_THREADS);
+
+    constexpr uint NUM_WARPS = K10_NUM_THREADS / 32;
+
+    // warptile in threadblocktile
+    static_assert((K10_BN % K10_WN == 0) and (K10_BM % K10_WM == 0));
+    static_assert((K10_BN / K10_WN) * (K10_BM / K10_WM) == NUM_WARPS);
+
+    // threads in warpsubtile
+    static_assert((K10_WM * K10_WN) % (WARPSIZE * K10_TM * K10_TN * K10_WNITER) ==
+                  0);
+    constexpr uint K10_WMITER =
+            (K10_WM * K10_WN) / (32 * K10_TM * K10_TN * K10_WNITER);
+    // warpsubtile in warptile
+    static_assert((K10_WM % K10_WMITER == 0) and (K10_WN % K10_WNITER == 0));
+
+    static_assert((K10_NUM_THREADS * 4) % K10_BK == 0,
+                  "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
+                  "issues during GMEM->SMEM tiling (loading only parts of the "
+                  "final row of Bs during each iteraion)");
+    static_assert((K10_NUM_THREADS * 4) % K10_BN == 0,
+                  "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
+                  "issues during GMEM->SMEM tiling (loading only parts of the "
+                  "final row of As during each iteration)");
+    static_assert(K10_BN % (16 * K10_TN) == 0,
+                  "BN must be a multiple of 16*TN to avoid quantization effects");
+    static_assert(K10_BM % (16 * K10_TM) == 0,
+                  "BM must be a multiple of 16*TM to avoid quantization effects");
+    static_assert((K10_BM * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+                  "BM*BK must be a multiple of 4*256 to vectorize loads");
+    static_assert((K10_BN * K10_BK) % (4 * K10_NUM_THREADS) == 0,
+                  "BN*BK must be a multiple of 4*256 to vectorize loads");
+
+    dim3 gridDim(CEIL_DIV(N, K10_BN), CEIL_DIV(M, K10_BM));
+    sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
+            K10_TN, K10_NUM_THREADS>
+    sgemmWarptiling<K10_BM, K10_BN, K10_BK, K10_WM, K10_WN, K10_WNITER, K10_TM,
+            K10_TN, K10_NUM_THREADS><<<>>>()
+
+    compute_distances_no_shared<<<grid0, block0>>>(ref_dev, ref_nb, ref_pitch, query_dev, query_nb, query_pitch, dim,
+                                                   dist_dev);
+    if (cudaGetLastError() != cudaSuccess) {
+        printf("ERROR: Unable to execute kernel\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Sort the distances with their respective indexes
+    dim3 block1(256, 1, 1);
+    dim3 grid1(query_nb / 256, 1, 1);
+    if (query_nb % 256 != 0) grid1.x += 1;
+    modified_insertion_sort<<<grid1, block1>>>(dist_dev, dist_pitch, index_dev, index_pitch, query_nb, ref_nb, k);
+    if (cudaGetLastError() != cudaSuccess) {
+        printf("ERROR: Unable to execute kernel\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Compute the square root of the k smallest distances
+    dim3 block2(16, 16, 1);
+    dim3 grid2(query_nb / 16, k / 16, 1);
+    if (query_nb % 16 != 0) grid2.x += 1;
+    if (k % 16 != 0) grid2.y += 1;
+    compute_sqrt<<<grid2, block2>>>(dist_dev, query_nb, query_pitch, k);
+    if (cudaGetLastError() != cudaSuccess) {
+        printf("ERROR: Unable to execute kernel\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Copy k smallest distances / indexes from the device to the host
+    err0 = cudaMemcpy(knn_dist, dist_dev, query_nb * size_of_float * k, cudaMemcpyDeviceToHost);
+    err1 = cudaMemcpy(knn_index, index_dev, query_nb * size_of_int * k, cudaMemcpyDeviceToHost);
+
+    if (err0 != cudaSuccess || err1 != cudaSuccess) {
+        printf("ERROR: Unable to copy data from device to host\n");
+        cudaFree(ref_dev);
+        cudaFree(query_dev);
+        cudaFree(dist_dev);
+        cudaFree(index_dev);
+        return false;
+    }
+
+    // Memory clean-up
+    cudaFree(ref_dev);
+    cudaFree(query_dev);
+    cudaFree(dist_dev);
+    cudaFree(index_dev);
+
+    return true;
+}
+
+
+bool knn_cuda_texture(const float *ref,
+                      int ref_nb,
+                      const float *query,
+                      int query_nb,
+                      int dim,
+                      int k,
+                      float *knn_dist,
+                      int *knn_index) {
 
     // Constants
     unsigned int size_of_float = sizeof(float);
-    unsigned int size_of_int   = sizeof(int);   
+    unsigned int size_of_int = sizeof(int);
 
     // Return variables
     cudaError_t err0, err1, err2;
@@ -607,26 +1000,26 @@ bool knn_cuda_texture(const float * ref,
     }
 
     // Allocate global memory
-    float * query_dev = NULL;
-    float * dist_dev  = NULL;
-    int *   index_dev = NULL;
-    size_t  query_pitch_in_bytes;
-    size_t  dist_pitch_in_bytes;
-    size_t  index_pitch_in_bytes;
-    err0 = cudaMallocPitch((void**)&query_dev, &query_pitch_in_bytes, query_nb * size_of_float, dim);
-    err1 = cudaMallocPitch((void**)&dist_dev,  &dist_pitch_in_bytes,  query_nb * size_of_float, ref_nb);
-    err2 = cudaMallocPitch((void**)&index_dev, &index_pitch_in_bytes, query_nb * size_of_int,   k);
+    float *query_dev = NULL;
+    float *dist_dev = NULL;
+    int *index_dev = NULL;
+    size_t query_pitch_in_bytes;
+    size_t dist_pitch_in_bytes;
+    size_t index_pitch_in_bytes;
+    err0 = cudaMallocPitch((void **) &query_dev, &query_pitch_in_bytes, query_nb * size_of_float, dim);
+    err1 = cudaMallocPitch((void **) &dist_dev, &dist_pitch_in_bytes, query_nb * size_of_float, ref_nb);
+    err2 = cudaMallocPitch((void **) &index_dev, &index_pitch_in_bytes, query_nb * size_of_int, k);
     if (err0 != cudaSuccess || err1 != cudaSuccess || err2 != cudaSuccess) {
         printf("ERROR: Memory allocation error (cudaMallocPitch)\n");
         cudaFree(query_dev);
         cudaFree(dist_dev);
-        cudaFree(index_dev); 
+        cudaFree(index_dev);
         return false;
     }
 
     // Deduce pitch values
     size_t query_pitch = query_pitch_in_bytes / size_of_float;
-    size_t dist_pitch  = dist_pitch_in_bytes  / size_of_float;
+    size_t dist_pitch = dist_pitch_in_bytes / size_of_float;
     size_t index_pitch = index_pitch_in_bytes / size_of_int;
 
     // Check pitch values
@@ -634,22 +1027,23 @@ bool knn_cuda_texture(const float * ref,
         printf("ERROR: Invalid pitch value\n");
         cudaFree(query_dev);
         cudaFree(dist_dev);
-        cudaFree(index_dev); 
-        return false; 
+        cudaFree(index_dev);
+        return false;
     }
 
     // Copy query data from the host to the device
-    err0 = cudaMemcpy2D(query_dev, query_pitch_in_bytes, query, query_nb * size_of_float, query_nb * size_of_float, dim, cudaMemcpyHostToDevice);
+    err0 = cudaMemcpy2D(query_dev, query_pitch_in_bytes, query, query_nb * size_of_float, query_nb * size_of_float, dim,
+                        cudaMemcpyHostToDevice);
     if (err0 != cudaSuccess) {
         printf("ERROR: Unable to copy data from host to device\n");
         cudaFree(query_dev);
         cudaFree(dist_dev);
-        cudaFree(index_dev);        
-        return false; 
+        cudaFree(index_dev);
+        return false;
     }
 
     // Allocate CUDA array for reference points
-    cudaArray* ref_array_dev = NULL;
+    cudaArray *ref_array_dev = NULL;
     cudaChannelFormatDesc channel_desc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
     err0 = cudaMallocArray(&ref_array_dev, &channel_desc, ref_nb, dim);
     if (err0 != cudaSuccess) {
@@ -657,7 +1051,7 @@ bool knn_cuda_texture(const float * ref,
         cudaFree(query_dev);
         cudaFree(dist_dev);
         cudaFree(index_dev);
-        return false; 
+        return false;
     }
 
     // Copy reference points from host to device
@@ -668,22 +1062,22 @@ bool knn_cuda_texture(const float * ref,
         cudaFree(dist_dev);
         cudaFree(index_dev);
         cudaFreeArray(ref_array_dev);
-        return false; 
+        return false;
     }
 
     // Resource descriptor
     struct cudaResourceDesc res_desc;
     memset(&res_desc, 0, sizeof(res_desc));
-    res_desc.resType         = cudaResourceTypeArray;
+    res_desc.resType = cudaResourceTypeArray;
     res_desc.res.array.array = ref_array_dev;
 
     // Texture descriptor
     struct cudaTextureDesc tex_desc;
     memset(&tex_desc, 0, sizeof(tex_desc));
-    tex_desc.addressMode[0]   = cudaAddressModeClamp;
-    tex_desc.addressMode[1]   = cudaAddressModeClamp;
-    tex_desc.filterMode       = cudaFilterModePoint;
-    tex_desc.readMode         = cudaReadModeElementType;
+    tex_desc.addressMode[0] = cudaAddressModeClamp;
+    tex_desc.addressMode[1] = cudaAddressModeClamp;
+    tex_desc.filterMode = cudaFilterModePoint;
+    tex_desc.readMode = cudaReadModeElementType;
     tex_desc.normalizedCoords = 0;
 
     // Create the texture
@@ -695,14 +1089,14 @@ bool knn_cuda_texture(const float * ref,
         cudaFree(dist_dev);
         cudaFree(index_dev);
         cudaFreeArray(ref_array_dev);
-        return false; 
+        return false;
     }
 
     // Compute the squared Euclidean distances
     dim3 block0(16, 16, 1);
     dim3 grid0(query_nb / 16, ref_nb / 16, 1);
     if (query_nb % 16 != 0) grid0.x += 1;
-    if (ref_nb   % 16 != 0) grid0.y += 1;
+    if (ref_nb % 16 != 0) grid0.y += 1;
     compute_distance_texture<<<grid0, block0>>>(ref_tex_dev, ref_nb, query_dev, query_nb, query_pitch, dim, dist_dev);
     if (cudaGetLastError() != cudaSuccess) {
         printf("ERROR: Unable to execute kernel\n");
@@ -733,8 +1127,8 @@ bool knn_cuda_texture(const float * ref,
     dim3 block2(16, 16, 1);
     dim3 grid2(query_nb / 16, k / 16, 1);
     if (query_nb % 16 != 0) grid2.x += 1;
-    if (k % 16 != 0)        grid2.y += 1;
-    compute_sqrt<<<grid2, block2>>>(dist_dev, query_nb, query_pitch, k);	
+    if (k % 16 != 0) grid2.y += 1;
+    compute_sqrt<<<grid2, block2>>>(dist_dev, query_nb, query_pitch, k);
     if (cudaGetLastError() != cudaSuccess) {
         printf("ERROR: Unable to execute kernel\n");
         cudaFree(query_dev);
@@ -746,8 +1140,10 @@ bool knn_cuda_texture(const float * ref,
     }
 
     // Copy k smallest distances / indexes from the device to the host
-    err0 = cudaMemcpy2D(knn_dist,  query_nb * size_of_float, dist_dev,  dist_pitch_in_bytes,  query_nb * size_of_float, k, cudaMemcpyDeviceToHost);
-    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int,   index_dev, index_pitch_in_bytes, query_nb * size_of_int,   k, cudaMemcpyDeviceToHost);
+    err0 = cudaMemcpy2D(knn_dist, query_nb * size_of_float, dist_dev, dist_pitch_in_bytes, query_nb * size_of_float, k,
+                        cudaMemcpyDeviceToHost);
+    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int, index_dev, index_pitch_in_bytes, query_nb * size_of_int, k,
+                        cudaMemcpyDeviceToHost);
     if (err0 != cudaSuccess || err1 != cudaSuccess) {
         printf("ERROR: Unable to copy data from device to host\n");
         cudaFree(query_dev);
@@ -755,7 +1151,7 @@ bool knn_cuda_texture(const float * ref,
         cudaFree(index_dev);
         cudaFreeArray(ref_array_dev);
         cudaDestroyTextureObject(ref_tex_dev);
-        return false; 
+        return false;
     }
 
     // Memory clean-up
@@ -769,21 +1165,21 @@ bool knn_cuda_texture(const float * ref,
 }
 
 
-bool knn_cublas(const float * ref,
-                int           ref_nb,
-                const float * query,
-                int           query_nb,
-                int           dim, 
-                int           k, 
-                float *       knn_dist,
-                int *         knn_index) {
+bool knn_cublas(const float *ref,
+                int ref_nb,
+                const float *query,
+                int query_nb,
+                int dim,
+                int k,
+                float *knn_dist,
+                int *knn_index) {
 
     // Constants
     const unsigned int size_of_float = sizeof(float);
-    const unsigned int size_of_int   = sizeof(int);
+    const unsigned int size_of_int = sizeof(int);
 
     // Return variables
-    cudaError_t  err0, err1, err2, err3, err4, err5;
+    cudaError_t err0, err1, err2, err3, err4, err5;
 
     // Check that we have at least one CUDA device 
     int nb_devices;
@@ -804,23 +1200,24 @@ bool knn_cublas(const float * ref,
     cublasInit();
 
     // Allocate global memory
-    float * ref_dev        = NULL;
-    float * query_dev      = NULL;
-    float * dist_dev       = NULL;
-    int   * index_dev      = NULL;
-    float * ref_norm_dev   = NULL;
-    float * query_norm_dev = NULL;
-    size_t  ref_pitch_in_bytes;
-    size_t  query_pitch_in_bytes;
-    size_t  dist_pitch_in_bytes;
-    size_t  index_pitch_in_bytes;
-    err0 = cudaMallocPitch((void**)&ref_dev,   &ref_pitch_in_bytes,   ref_nb   * size_of_float, dim);
-    err1 = cudaMallocPitch((void**)&query_dev, &query_pitch_in_bytes, query_nb * size_of_float, dim);
-    err2 = cudaMallocPitch((void**)&dist_dev,  &dist_pitch_in_bytes,  query_nb * size_of_float, ref_nb);
-    err3 = cudaMallocPitch((void**)&index_dev, &index_pitch_in_bytes, query_nb * size_of_int,   k);
-    err4 = cudaMalloc((void**)&ref_norm_dev,   ref_nb   * size_of_float);
-    err5 = cudaMalloc((void**)&query_norm_dev, query_nb * size_of_float);
-    if (err0 != cudaSuccess || err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess || err4 != cudaSuccess || err5 != cudaSuccess) {
+    float *ref_dev = NULL;
+    float *query_dev = NULL;
+    float *dist_dev = NULL;
+    int *index_dev = NULL;
+    float *ref_norm_dev = NULL;
+    float *query_norm_dev = NULL;
+    size_t ref_pitch_in_bytes;
+    size_t query_pitch_in_bytes;
+    size_t dist_pitch_in_bytes;
+    size_t index_pitch_in_bytes;
+    err0 = cudaMallocPitch((void **) &ref_dev, &ref_pitch_in_bytes, ref_nb * size_of_float, dim);
+    err1 = cudaMallocPitch((void **) &query_dev, &query_pitch_in_bytes, query_nb * size_of_float, dim);
+    err2 = cudaMallocPitch((void **) &dist_dev, &dist_pitch_in_bytes, query_nb * size_of_float, ref_nb);
+    err3 = cudaMallocPitch((void **) &index_dev, &index_pitch_in_bytes, query_nb * size_of_int, k);
+    err4 = cudaMalloc((void **) &ref_norm_dev, ref_nb * size_of_float);
+    err5 = cudaMalloc((void **) &query_norm_dev, query_nb * size_of_float);
+    if (err0 != cudaSuccess || err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess ||
+        err4 != cudaSuccess || err5 != cudaSuccess) {
         printf("ERROR: Memory allocation error\n");
         cudaFree(ref_dev);
         cudaFree(query_dev);
@@ -833,9 +1230,9 @@ bool knn_cublas(const float * ref,
     }
 
     // Deduce pitch values
-    size_t ref_pitch   = ref_pitch_in_bytes   / size_of_float;
+    size_t ref_pitch = ref_pitch_in_bytes / size_of_float;
     size_t query_pitch = query_pitch_in_bytes / size_of_float;
-    size_t dist_pitch  = dist_pitch_in_bytes  / size_of_float;
+    size_t dist_pitch = dist_pitch_in_bytes / size_of_float;
     size_t index_pitch = index_pitch_in_bytes / size_of_int;
 
     // Check pitch values
@@ -848,12 +1245,14 @@ bool knn_cublas(const float * ref,
         cudaFree(ref_norm_dev);
         cudaFree(query_norm_dev);
         cublasShutdown();
-        return false; 
+        return false;
     }
 
     // Copy reference and query data from the host to the device
-    err0 = cudaMemcpy2D(ref_dev,   ref_pitch_in_bytes,   ref,   ref_nb * size_of_float,   ref_nb * size_of_float,   dim, cudaMemcpyHostToDevice);
-    err1 = cudaMemcpy2D(query_dev, query_pitch_in_bytes, query, query_nb * size_of_float, query_nb * size_of_float, dim, cudaMemcpyHostToDevice);
+    err0 = cudaMemcpy2D(ref_dev, ref_pitch_in_bytes, ref, ref_nb * size_of_float, ref_nb * size_of_float, dim,
+                        cudaMemcpyHostToDevice);
+    err1 = cudaMemcpy2D(query_dev, query_pitch_in_bytes, query, query_nb * size_of_float, query_nb * size_of_float, dim,
+                        cudaMemcpyHostToDevice);
     if (err0 != cudaSuccess || err1 != cudaSuccess) {
         printf("ERROR: Unable to copy data from host to device\n");
         cudaFree(ref_dev);
@@ -863,7 +1262,7 @@ bool knn_cublas(const float * ref,
         cudaFree(ref_norm_dev);
         cudaFree(query_norm_dev);
         cublasShutdown();
-        return false; 
+        return false;
     }
 
     // Compute the squared norm of the reference points
@@ -901,7 +1300,8 @@ bool knn_cublas(const float * ref,
     }
 
     // Computation of query*transpose(reference)
-    cublasSgemm('n', 't', (int)query_pitch, (int)ref_pitch, dim, (float)-2.0, query_dev, query_pitch, ref_dev, ref_pitch, (float)0.0, dist_dev, query_pitch);
+    cublasSgemm('n', 't', (int) query_pitch, (int) ref_pitch, dim, (float) -2.0, query_dev, query_pitch, ref_dev,
+                ref_pitch, (float) 0.0, dist_dev, query_pitch);
     if (cublasGetError() != CUBLAS_STATUS_SUCCESS) {
         printf("ERROR: Unable to execute cublasSgemm\n");
         cudaFree(ref_dev);
@@ -911,14 +1311,14 @@ bool knn_cublas(const float * ref,
         cudaFree(ref_norm_dev);
         cudaFree(query_norm_dev);
         cublasShutdown();
-        return false;       
+        return false;
     }
 
     // Add reference points norm
     dim3 block2(16, 16, 1);
     dim3 grid2(query_nb / 16, ref_nb / 16, 1);
     if (query_nb % 16 != 0) grid2.x += 1;
-    if (ref_nb   % 16 != 0) grid2.y += 1;
+    if (ref_nb % 16 != 0) grid2.y += 1;
     add_reference_points_norm<<<grid2, block2>>>(dist_dev, query_nb, dist_pitch, ref_nb, ref_norm_dev);
     if (cudaGetLastError() != cudaSuccess) {
         printf("ERROR: Unable to execute kernel\n");
@@ -950,7 +1350,7 @@ bool knn_cublas(const float * ref,
     dim3 block3(16, 16, 1);
     dim3 grid3(query_nb / 16, k / 16, 1);
     if (query_nb % 16 != 0) grid3.x += 1;
-    if (k        % 16 != 0) grid3.y += 1;
+    if (k % 16 != 0) grid3.y += 1;
     add_query_points_norm_and_sqrt<<<grid3, block3>>>(dist_dev, query_nb, dist_pitch, k, query_norm_dev);
     if (cudaGetLastError() != cudaSuccess) {
         printf("ERROR: Unable to execute kernel\n");
@@ -965,8 +1365,10 @@ bool knn_cublas(const float * ref,
     }
 
     // Copy k smallest distances / indexes from the device to the host
-    err0 = cudaMemcpy2D(knn_dist,  query_nb * size_of_float, dist_dev,  dist_pitch_in_bytes,  query_nb * size_of_float, k, cudaMemcpyDeviceToHost);
-    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int,   index_dev, index_pitch_in_bytes, query_nb * size_of_int,   k, cudaMemcpyDeviceToHost);
+    err0 = cudaMemcpy2D(knn_dist, query_nb * size_of_float, dist_dev, dist_pitch_in_bytes, query_nb * size_of_float, k,
+                        cudaMemcpyDeviceToHost);
+    err1 = cudaMemcpy2D(knn_index, query_nb * size_of_int, index_dev, index_pitch_in_bytes, query_nb * size_of_int, k,
+                        cudaMemcpyDeviceToHost);
     if (err0 != cudaSuccess || err1 != cudaSuccess) {
         printf("ERROR: Unable to copy data from device to host\n");
         cudaFree(ref_dev);
@@ -976,7 +1378,7 @@ bool knn_cublas(const float * ref,
         cudaFree(ref_norm_dev);
         cudaFree(query_norm_dev);
         cublasShutdown();
-        return false; 
+        return false;
     }
 
     // Memory clean-up and CUBLAS shutdown

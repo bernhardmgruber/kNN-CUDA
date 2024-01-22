@@ -338,8 +338,8 @@ bool test(const float * ref,
 int main(void) {
 
     // Parameters
-    const int ref_nb   = 16384 / 4;
-    const int query_nb = 4096 / 4;
+    const int ref_nb   = 16384;
+    const int query_nb = 4096;
     const int dim      = 128;
     const int k        = 16;
     constexpr int iterations = 10;
@@ -388,8 +388,9 @@ int main(void) {
 
     // Test all k-NN functions
     printf("TESTS\n");
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_c,        "knn_c",              2);
-    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_bgruber, "knn_bgruber", 2);
+    //test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_c,        "knn_c",              2);
+    //test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_bgruber, "knn_bgruber", 2);
+    test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global_gemm, "knn_gemm", iterations);
     test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global, "knn_cuda_global", iterations);
     test(ref, ref_nb, query, query_nb, dim, k, knn_dist, knn_index, &knn_cuda_global_no_shared, "knn_cuda_global_nsm",
          iterations);
